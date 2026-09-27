@@ -100,6 +100,7 @@ llama_context::llama_context(
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+    cparams.n_kv_vram_cells = params.n_kv_vram_cells;
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
@@ -3851,6 +3852,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.n_kv_vram_cells             =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
