@@ -335,13 +335,31 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
-    // Qwen3Next uses a single Q projection that outputs query + gate
-    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-    cb(Qcur_full, "Qcur_full", il);
+    ggml_tensor * Qcur;
+    ggml_tensor * gate;
+    if (model.layers[il].wqkv_gate) {
+        // Mirai S GGUFs store the attention output gate as its own weight (attn_gate); wq holds the query only
+        ggml_tensor * q = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+        cb(q, "Qcur_full", il);
+        Qcur = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, n_tokens);
+        gate = build_lora_mm(model.layers[il].wqkv_gate, cur, model.layers[il].wqkv_gate_s);
+        cb(gate, "gate_reshaped", il);
+    } else {
+        // Qwen3Next uses a single Q projection that outputs query + gate
+        ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+        cb(Qcur_full, "Qcur_full", il);
 
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+        Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+
+        gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qcur_full) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+        cb(gate, "gate_reshaped", il);
+    }
     cb(Qcur, "Qcur_reshaped", il);
 
     // Apply Q normalization
