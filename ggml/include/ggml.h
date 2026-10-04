@@ -432,6 +432,12 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         // Prism-private Q2_0 at group size 128 (upstream Q2_0 is group 64). High id so it
         // slots above upstream types; type_traits is sized to COUNT (143) with 43..141 unused.
+        // Mirai S trellis formats (ids as in alesha-pro/llama.cpp-mirai-s so its GGUFs load unchanged). Opaque rows,
+        // interleaved in groups of 32; only ggml_mirai_mul_mat reads them.
+        GGML_TYPE_MS_V4T8 = 90,
+        GGML_TYPE_MS_V2T4 = 91,
+        GGML_TYPE_MS_V2T6 = 92,
+        GGML_TYPE_MS_I3   = 93,
         GGML_TYPE_PQ2_0 = 142,
         GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary, group 128
         GGML_TYPE_COUNT   = 144,
@@ -580,6 +586,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_MIRAI_QUANTIZE,
+        GGML_OP_MIRAI_MUL_MAT,
 
         GGML_OP_UNARY,
 
@@ -2684,6 +2692,32 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Mirai S linears (trellis-compressed weights, see ggml/src/ggml-cpu/mirai-s.cpp for the math).
+    // A weight W [K, N] of an MS_* trellis type computes y = W x in the rotated domain: x_rot = R (signs * x), with R the
+    // Walsh-Hadamard (x) small_q rotation, is quantized to two int8 planes per token (x_rot ~ s * (q0 + q1 / 254)).
+    // ggml_mirai_quantize does that once per input; several weights sharing an input share its result.
+    //   rot: f32 [K + order^2], the signs then small_q (row-major); result: opaque I32 [K / 2 + 8, n_tokens]
+    // The MS_I3 output head instead takes x_rot = H32(signs * x) (normalized Walsh-Hadamard on 32 columns) as f16:
+    //   head = true, rot: f32 [K] the signs; result: F16 [K, n_tokens]
+    GGML_API bool ggml_is_mirai_s(enum ggml_type type);
+
+    GGML_API struct ggml_tensor * ggml_mirai_quantize(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,     // f32 [K, n_tokens], contiguous
+            struct ggml_tensor  * rot,
+            bool                  head);
+
+    // y [N, n_tokens] f32 = scale * (W x), from xq = ggml_mirai_quantize(x, ...).
+    //   trellis W: codebook = {c, d0, d1, d2, d3} of the format's family (v4 or v2), aux NULL
+    //   MS_I3 W:   codebook NULL, aux f32 [16] the ladder
+    GGML_API struct ggml_tensor * ggml_mirai_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * xq,
+            struct ggml_tensor  * scale, // f32 [N]
+            struct ggml_tensor  * aux,
+            const float         * codebook);
 
     // custom operators
 

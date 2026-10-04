@@ -1819,7 +1819,15 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
-    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+    // Mirai S weights apply their per-row scale inside the matmul
+    ggml_tensor * up_ms   = up   && ggml_is_mirai_s(up->type)   ? up_s   : nullptr;
+    ggml_tensor * gate_ms = gate && ggml_is_mirai_s(gate->type) ? gate_s : nullptr;
+    ggml_tensor * down_ms = down && ggml_is_mirai_s(down->type) ? down_s : nullptr;
+    if (up_ms)   { up_s   = nullptr; }
+    if (gate_ms) { gate_s = nullptr; }
+    if (down_ms) { down_s = nullptr; }
+
+    ggml_tensor * tmp = up ? build_lora_mm(up, cur, up_ms) : cur;
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -1836,12 +1844,12 @@ ggml_tensor * llm_graph_context::build_ffn(
         switch (type_gate) {
             case LLM_FFN_SEQ:
                 {
-                    cur = build_lora_mm(gate, tmp);
+                    cur = build_lora_mm(gate, tmp, gate_ms);
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
                 {
-                    cur = build_lora_mm(gate, cur);
+                    cur = build_lora_mm(gate, cur, gate_ms);
                     cb(cur, "ffn_gate", il);
                 } break;
         }

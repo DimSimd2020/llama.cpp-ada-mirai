@@ -30,6 +30,7 @@ struct llama_hadamard_transform {
     int64_t perm_nk  = 0;
     int64_t perm_rep = 0;
 };
+struct llama_mirai_s;
 using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
 
 struct llama_cparams;
@@ -863,6 +864,7 @@ struct llm_graph_params {
     int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    const llama_mirai_s * mirai = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1128,6 +1130,11 @@ struct llm_graph_context {
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
 
+    const llama_mirai_s * mirai;
+
+    // Mirai S: quantized inputs by (input, head), so weights sharing an input share one ggml_mirai_quantize
+    mutable std::map<std::pair<const ggml_tensor *, bool>, ggml_tensor *> mirai_xq;
+
     // Transforms shared by folded weights on the same activation. Key is (input, rotation);
     // both must match. Valid for one graph build only.
     mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
@@ -1159,6 +1166,12 @@ struct llm_graph_context {
               ggml_tensor * w,
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
+
+    // Mirai S weight: w_s is its per-row scale, applied inside the matmul
+    ggml_tensor * build_mirai_mm(
+              ggml_tensor * w,
+              ggml_tensor * cur,
+              ggml_tensor * w_s) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(

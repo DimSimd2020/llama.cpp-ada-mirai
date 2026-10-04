@@ -68,6 +68,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/mirai-s.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2695,6 +2696,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_MIRAI_QUANTIZE:
+            ggml_cuda_op_mirai_quantize(ctx, dst);
+            break;
+        case GGML_OP_MIRAI_MUL_MAT:
+            ggml_cuda_op_mirai_mul_mat(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);

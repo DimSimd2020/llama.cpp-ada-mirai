@@ -587,6 +587,22 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+// Mirai S (trellis-compressed linears, ggml_mirai_quantize / ggml_mirai_mul_mat): the model-wide tensors and constants
+struct llama_mirai_s {
+    ggml_tensor * rot_5120  = nullptr;  // f32 [K + order^2]: signs, then small_q
+    ggml_tensor * rot_6144  = nullptr;
+    ggml_tensor * rot_17408 = nullptr;
+    ggml_tensor * head_aux  = nullptr;  // f32 [n_embd + 16]: the head's input signs, then its ladder
+
+    float codebook_v4[5] = {};  // {c, d0, d1, d2, d3}
+    float codebook_v2[5] = {};
+
+    bool enabled = false;
+
+    ggml_tensor * rot(int64_t n_in) const;
+    const float * codebook(ggml_type type) const;
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -718,6 +734,9 @@ struct llama_model {
     bool hadamard_tied_output = false;
     llama_hadamard_rotations hadamard_rotations;
     llama_hadamard_rotations hadamard_inverses;
+
+    // Mirai S tensors, when the GGUF has them
+    llama_mirai_s mirai;
 
     // list of devices used in this model
     std::vector<llama_device> devices;
