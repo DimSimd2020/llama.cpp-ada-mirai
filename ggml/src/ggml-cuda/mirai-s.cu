@@ -14,6 +14,8 @@
 
 #include <cublasLt.h>
 
+#include <cstring>
+
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -803,7 +805,7 @@ static void lt_int8_gemm(ggml_backend_cuda_context & ctx, int64_t rows, int64_t 
 
 template <typename F>
 void launch_mul_mat(ggml_backend_cuda_context & ctx, const u8 * w, int64_t K, int64_t rows, const float * rowscale,
-                    const uint2 * q, const float * stats, codebook_t codebook, float * y, int64_t tokens) {
+                    const uint2 * q, const float * stats, codebook_t codebook, float * y, int64_t tokens, int prefill_planes) {
     cudaStream_t stream = ctx.stream();
     const int packets_per_row = K / F::columns, groups = rows / 32, groups_per_token = K / 4;
     if (tokens == 1) {
@@ -823,9 +825,8 @@ void launch_mul_mat(ggml_backend_cuda_context & ctx, const u8 * w, int64_t K, in
         return;
     }
     // long inputs: planes [2 * tokens][K]; the weights in chunks of rows as int8 levels, one int8 GEMM per chunk.
-    // GGML_MIRAI_PREFILL_PLANES=1: multiply plane 0 only (half the GEMM work; the activations become per-token int8).
-    // Experimental; the decode and small-batch paths are untouched. Gated by KL against the two-plane path.
-    static const int prefill_planes = env_tokens("GGML_MIRAI_PREFILL_PLANES", 2) == 1 ? 1 : 2;
+    // prefill_planes == 1 (GGML_MIRAI_PREFILL_PLANES, see prefill_planes_for): multiply plane 0 only (half the GEMM
+    // work; the activations become per-token int8). The decode and small-batch paths are untouched. Gated by KL.
     const int64_t plane_cols = prefill_planes * tokens;
     ggml_cuda_pool_alloc<u32> planes(ctx.pool(), 2 * tokens * (K / 4));
     split_planes<<<dim3((groups_per_token + 255) / 256, tokens), 256, 0, stream>>>(q, groups_per_token, tokens, planes.get());
@@ -913,10 +914,18 @@ void ggml_cuda_op_mirai_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     memcpy(codebook.c, dst->op_params, sizeof(codebook.c));
     const uint2 * q = static_cast<const uint2 *>(xq->data);
     const float * stats = reinterpret_cast<const float *>(q + tokens * (K / 4));
+    // GGML_MIRAI_PREFILL_PLANES: unset/2 = both activation planes (exact); 1 = plane 0 only for every long-input
+    // matmul; ffn = plane 0 only for the ffn_* matmuls (~75% of the prefill GEMM work), both planes for the
+    // attention projections (their K/V persist in the cache) and ssm_out. Experimental, measured by KL.
+    static const int plane_mode = [] {
+        const char * s = getenv("GGML_MIRAI_PREFILL_PLANES");
+        return s == nullptr ? 0 : strcmp(s, "1") == 0 ? 1 : strcmp(s, "ffn") == 0 ? 2 : 0;
+    }();
+    const int planes = plane_mode == 1 ? 1 : (plane_mode == 2 && strstr(w->name, "ffn_") != nullptr) ? 1 : 2;
     switch (w->type) {
-        case GGML_TYPE_MS_V4T8: launch_mul_mat<fmt_v4t8>(ctx, w_d, K, rows, rowscale, q, stats, codebook, y, tokens); break;
-        case GGML_TYPE_MS_V2T4: launch_mul_mat<fmt_v2t4>(ctx, w_d, K, rows, rowscale, q, stats, codebook, y, tokens); break;
-        case GGML_TYPE_MS_V2T6: launch_mul_mat<fmt_v2t6>(ctx, w_d, K, rows, rowscale, q, stats, codebook, y, tokens); break;
+        case GGML_TYPE_MS_V4T8: launch_mul_mat<fmt_v4t8>(ctx, w_d, K, rows, rowscale, q, stats, codebook, y, tokens, planes); break;
+        case GGML_TYPE_MS_V2T4: launch_mul_mat<fmt_v2t4>(ctx, w_d, K, rows, rowscale, q, stats, codebook, y, tokens, planes); break;
+        case GGML_TYPE_MS_V2T6: launch_mul_mat<fmt_v2t6>(ctx, w_d, K, rows, rowscale, q, stats, codebook, y, tokens, planes); break;
         default: GGML_ABORT("Mirai S: not a trellis type");
     }
 }
