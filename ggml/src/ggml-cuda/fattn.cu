@@ -638,7 +638,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_tensor * mask_in = dst->src[3];
     ggml_tensor mask_f16;
     ggml_cuda_pool_alloc<half> mask_buf(ctx.pool());
-    if (mask_in && mask_in->type == GGML_TYPE_I32) {
+    // the tensor-core kernel reads packed bits natively; the vec and tile kernels get the expanded f16 copy
+    const best_fattn_kernel best_for_mask = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (mask_in && mask_in->type == GGML_TYPE_I32 && best_for_mask != BEST_FATTN_KERNEL_MMA_F16) {
         const int64_t n_words = mask_in->ne[0];
         const int64_t rows    = mask_in->ne[1]*mask_in->ne[2]*mask_in->ne[3];
         mask_buf.alloc(n_words*32*rows);
