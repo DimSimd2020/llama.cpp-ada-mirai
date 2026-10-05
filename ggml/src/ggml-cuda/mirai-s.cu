@@ -569,13 +569,17 @@ __global__ void split_planes(const uint2 * __restrict__ q, int groups_per_token,
 }
 
 // products: [2 * tokens][rows] int32, plane 0 of every token first, then plane 1. Grid (rows / 256, tokens).
+// one_plane (GGML_MIRAI_PREFILL_PLANES=1): only plane 0 was multiplied; the fine term is zeroed by handing
+// output_value a `fine` equal to its own offset (54 * sum q1), so the activations act as plain per-token int8
+// (s = max|x| / 127, round to nearest). The residue sums in stats keep their full precision.
 __global__ void prefill_output(const int * __restrict__ products, int tokens, int rows, const float * __restrict__ rowscale,
-                               const float * __restrict__ stats, codebook_t codebook, float * __restrict__ y, int y_stride) {
+                               const float * __restrict__ stats, codebook_t codebook, float * __restrict__ y, int y_stride,
+                               int one_plane) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x, token = blockIdx.y;
     if (row >= rows) return;
     const size_t index = static_cast<size_t>(token) * rows + row;
-    y[static_cast<size_t>(token) * y_stride + row] = output_value(
-        products[index], products[static_cast<size_t>(tokens) * rows + index], stats + token * 8, codebook, rowscale[row]);
+    const int fine = one_plane ? 54 * __float2int_rn(stats[token * 8 + 2]) : products[static_cast<size_t>(tokens) * rows + index];
+    y[static_cast<size_t>(token) * y_stride + row] = output_value(products[index], fine, stats + token * 8, codebook, rowscale[row]);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -818,19 +822,23 @@ void launch_mul_mat(ggml_backend_cuda_context & ctx, const u8 * w, int64_t K, in
         }
         return;
     }
-    // long inputs: planes [2 * tokens][K]; the weights in chunks of rows as int8 levels, one int8 GEMM per chunk
+    // long inputs: planes [2 * tokens][K]; the weights in chunks of rows as int8 levels, one int8 GEMM per chunk.
+    // GGML_MIRAI_PREFILL_PLANES=1: multiply plane 0 only (half the GEMM work; the activations become per-token int8).
+    // Experimental; the decode and small-batch paths are untouched. Gated by KL against the two-plane path.
+    static const int prefill_planes = env_tokens("GGML_MIRAI_PREFILL_PLANES", 2) == 1 ? 1 : 2;
+    const int64_t plane_cols = prefill_planes * tokens;
     ggml_cuda_pool_alloc<u32> planes(ctx.pool(), 2 * tokens * (K / 4));
     split_planes<<<dim3((groups_per_token + 255) / 256, tokens), 256, 0, stream>>>(q, groups_per_token, tokens, planes.get());
     const int64_t chunk_rows = std::min<int64_t>(rows, std::max<int64_t>(256, ((static_cast<int64_t>(LEVELS_MIB) << 20) / K) / 256 * 256));
     ggml_cuda_pool_alloc<u32> levels_buf(ctx.pool(), chunk_rows * (K / 4));
-    ggml_cuda_pool_alloc<int> products(ctx.pool(), 2 * tokens * chunk_rows);
+    ggml_cuda_pool_alloc<int> products(ctx.pool(), plane_cols * chunk_rows);
     for (int64_t first = 0; first < rows; first += chunk_rows) {
         const int64_t n_rows = std::min(chunk_rows, rows - first);
         levels<F><<<n_rows / 32, 32 * GEMV_WARPS, 0, stream>>>(w, packets_per_row, first / 32, levels_buf.get(), groups_per_token);
-        // column-major: C (n_rows x 2 tokens) = levels^T (n_rows x K) * planes (K x 2 tokens)
-        lt_int8_gemm(ctx, n_rows, 2 * tokens, K, levels_buf.get(), planes.get(), products.get());
+        // column-major: C (n_rows x plane_cols) = levels^T (n_rows x K) * planes (K x plane_cols); plane 0 comes first
+        lt_int8_gemm(ctx, n_rows, plane_cols, K, levels_buf.get(), planes.get(), products.get());
         prefill_output<<<dim3((n_rows + 255) / 256, tokens), 256, 0, stream>>>(
-            products.get(), tokens, n_rows, rowscale + first, stats, codebook, y + first, rows);
+            products.get(), tokens, n_rows, rowscale + first, stats, codebook, y + first, rows, prefill_planes == 1);
     }
 }
 
