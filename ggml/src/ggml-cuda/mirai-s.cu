@@ -37,9 +37,9 @@ static int env_tokens(const char * name, int fallback) {
 }
 static const int MMA_TOKENS   = env_tokens("GGML_MIRAI_MMA_TOKENS", 384);  // beyond this, levels + cuBLAS int8 GEMM
 static const int SPLIT_TOKENS = env_tokens("GGML_MIRAI_SPLIT_TOKENS", 16);  // up to this, rotate_columns + quantize_rows
-// long inputs decode the weights to int8 levels in chunks of rows of at most this many MiB (a transient buffer; whole
-// matrices were no faster end to end on a 220 W 3090)
-static const int LEVELS_MIB   = env_tokens("GGML_MIRAI_LEVELS_MIB", 32);
+// long inputs decode the weights to int8 levels in chunks of rows; this bounds the chunk's buffers (int8 levels plus
+// int32 products) in MiB. On a 4070: 64 -> 1038, 128 -> 1089, 256 -> 1086 tok/s on a 16.8k prompt; 128 is the knee.
+static const int LEVELS_MIB   = env_tokens("GGML_MIRAI_LEVELS_MIB", 128);
 constexpr int HEAD_WARPS = 8;
 constexpr int HEAD_SLAB = 72;   // halves per head slab row: 64 columns + 8 padding
 
@@ -803,6 +803,50 @@ static void lt_int8_gemm(ggml_backend_cuda_context & ctx, int64_t rows, int64_t 
                             &plan->algo, nullptr, 0, ctx.stream()));
 }
 
+// Per-device state of the pipelined long-input path: two chunk buffers for the decoded levels and the int32 products
+// (grown on demand, device-synchronized when they grow), the events that hand them between the two streams, and
+// which buffer the next chunk takes. The buffers live outside the pool because the side stream uses them past the
+// node that allocated them.
+struct pipe_state {
+    cudaEvent_t lv_ready[2] = {}, gemm_done[2] = {}, comb_done[2] = {}, fork = nullptr;
+    void * levels[2] = {}, * products[2] = {};
+    size_t levels_bytes = 0, products_bytes = 0;
+    int next = 0;
+};
+
+// nullptr when the buffers would have to grow and may not (inside a stream capture): the caller runs the serial path
+static pipe_state * pipe_at(ggml_backend_cuda_context & ctx, size_t levels_bytes, size_t products_bytes, bool may_grow) {
+    static pipe_state states[GGML_CUDA_MAX_DEVICES];
+    pipe_state & ps = states[ctx.device];
+    if ((levels_bytes > ps.levels_bytes || products_bytes > ps.products_bytes) && !may_grow) {
+        return nullptr;
+    }
+    if (!ps.fork) {
+        for (int b = 0; b < 2; ++b) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ps.lv_ready[b], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ps.gemm_done[b], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ps.comb_done[b], cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventCreateWithFlags(&ps.fork, cudaEventDisableTiming));
+    }
+    if (levels_bytes > ps.levels_bytes || products_bytes > ps.products_bytes) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        for (int b = 0; b < 2; ++b) {
+            if (levels_bytes > ps.levels_bytes) {
+                if (ps.levels[b]) CUDA_CHECK(cudaFree(ps.levels[b]));
+                CUDA_CHECK(cudaMalloc(&ps.levels[b], levels_bytes));
+            }
+            if (products_bytes > ps.products_bytes) {
+                if (ps.products[b]) CUDA_CHECK(cudaFree(ps.products[b]));
+                CUDA_CHECK(cudaMalloc(&ps.products[b], products_bytes));
+            }
+        }
+        ps.levels_bytes = std::max(levels_bytes, ps.levels_bytes);
+        ps.products_bytes = std::max(products_bytes, ps.products_bytes);
+    }
+    return &ps;
+}
+
 template <typename F>
 void launch_mul_mat(ggml_backend_cuda_context & ctx, const u8 * w, int64_t K, int64_t rows, const float * rowscale,
                     const uint2 * q, const float * stats, codebook_t codebook, float * y, int64_t tokens, int prefill_planes) {
@@ -832,12 +876,69 @@ void launch_mul_mat(ggml_backend_cuda_context & ctx, const u8 * w, int64_t K, in
     static const bool timing = getenv("GGML_MIRAI_TIMING") != nullptr;
     const int64_t plane_cols = prefill_planes * tokens;
     ggml_cuda_pool_alloc<u32> planes(ctx.pool(), 2 * tokens * (K / 4));
+    // chunk footprint: the int8 levels (K bytes per row) plus the int32 products (4 bytes per row per plane column),
+    // so a chunk is at most LEVELS_MIB of buffers whatever the matrix's K (small K used to give 256 MiB of products)
+    const int64_t chunk_rows = std::min<int64_t>(rows, std::max<int64_t>(256, ((static_cast<int64_t>(LEVELS_MIB) << 20) / (K + plane_cols * 4)) / 256 * 256));
+    // GGML_MIRAI_PIPELINE=1 (experiment; default off, measured 0 to -2.5% for +120-220 MiB on a 4070 because the int8
+    // GEMM runs at the tensor peak and leaves the SMs no room for the decode to co-run): the level decodes run on one
+    // side stream and the combines on another against the GEMMs on the main stream, through two persistent chunk
+    // buffers (levels, products) handed over by events. A decode waits only for the GEMM that last read its buffer, so
+    // the next node's first decode runs during this node's last GEMM (the decode stream must not queue behind the
+    // combines, hence the third stream); a combine waits for its GEMM and runs during the next one. The node joins both
+    // side streams before it returns, so y is complete for the main stream and the pool may reuse `planes`.
+    static const bool pipeline = env_tokens("GGML_MIRAI_PIPELINE", 0) != 0;
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capturing));
+    pipe_state * pipe_ptr = pipeline && !timing
+        ? pipe_at(ctx, static_cast<size_t>(chunk_rows) * K, static_cast<size_t>(plane_cols) * chunk_rows * sizeof(int), capturing == cudaStreamCaptureStatusNone)
+        : nullptr;
+    if (pipe_ptr) {
+        pipe_state & ps = *pipe_ptr;
+        split_planes<<<dim3((groups_per_token + 255) / 256, tokens), 256, 0, stream>>>(q, groups_per_token, tokens, planes.get());
+        cudaStream_t dec = ctx.stream(ctx.device, 1), cmb = ctx.stream(ctx.device, 2);
+        if (capturing != cudaStreamCaptureStatusNone) {
+            // fork the side streams from this capture; earlier work on both buffers is behind the main stream's tail
+            CUDA_CHECK(cudaEventRecord(ps.fork, stream));
+            CUDA_CHECK(cudaStreamWaitEvent(dec, ps.fork, 0));
+            CUDA_CHECK(cudaStreamWaitEvent(cmb, ps.fork, 0));
+            for (int b = 0; b < 2; ++b) {
+                CUDA_CHECK(cudaEventRecord(ps.gemm_done[b], stream));
+                CUDA_CHECK(cudaEventRecord(ps.comb_done[b], stream));
+            }
+        }
+        const int n_chunks = static_cast<int>((rows + chunk_rows - 1) / chunk_rows);
+        auto decode = [&](int chunk) {
+            const int b = (ps.next + chunk) & 1;
+            CUDA_CHECK(cudaStreamWaitEvent(dec, ps.gemm_done[b], 0));  // the GEMM that last read levels[b]
+            const int64_t first = static_cast<int64_t>(chunk) * chunk_rows, n_rows = std::min(chunk_rows, rows - first);
+            levels<F><<<n_rows / 32, 32 * GEMV_WARPS, 0, dec>>>(w, packets_per_row, first / 32, static_cast<u32 *>(ps.levels[b]), groups_per_token);
+            CUDA_CHECK(cudaEventRecord(ps.lv_ready[b], dec));
+        };
+        decode(0);
+        for (int chunk = 0; chunk < n_chunks; ++chunk) {
+            const int b = (ps.next + chunk) & 1;
+            if (chunk + 1 < n_chunks) decode(chunk + 1);
+            const int64_t first = static_cast<int64_t>(chunk) * chunk_rows, n_rows = std::min(chunk_rows, rows - first);
+            CUDA_CHECK(cudaStreamWaitEvent(stream, ps.lv_ready[b], 0));
+            CUDA_CHECK(cudaStreamWaitEvent(stream, ps.comb_done[b], 0));  // the combine that last read products[b]
+            lt_int8_gemm(ctx, n_rows, plane_cols, K, ps.levels[b], planes.get(), static_cast<int *>(ps.products[b]));
+            CUDA_CHECK(cudaEventRecord(ps.gemm_done[b], stream));
+            CUDA_CHECK(cudaStreamWaitEvent(cmb, ps.gemm_done[b], 0));
+            prefill_output<<<dim3((n_rows + 255) / 256, tokens), 256, 0, cmb>>>(
+                static_cast<int *>(ps.products[b]), tokens, n_rows, rowscale + first, stats, codebook, y + first, rows, prefill_planes == 1);
+            CUDA_CHECK(cudaEventRecord(ps.comb_done[b], cmb));
+        }
+        // join: the combines are in order on their stream, so the last one covers them all; the decodes of this node
+        // all precede its GEMMs, which the main stream already ordered
+        CUDA_CHECK(cudaStreamWaitEvent(stream, ps.comb_done[(ps.next + n_chunks - 1) & 1], 0));
+        ps.next = (ps.next + n_chunks) & 1;
+        return;
+    }
     cudaEvent_t ev[4];
     if (timing) { for (auto & e : ev) CUDA_CHECK(cudaEventCreate(&e)); CUDA_CHECK(cudaEventRecord(ev[0], stream)); }
     split_planes<<<dim3((groups_per_token + 255) / 256, tokens), 256, 0, stream>>>(q, groups_per_token, tokens, planes.get());
     float t_split = 0.0f, t_levels = 0.0f, t_gemm = 0.0f, t_out = 0.0f;
     if (timing) { CUDA_CHECK(cudaEventRecord(ev[1], stream)); CUDA_CHECK(cudaEventSynchronize(ev[1])); CUDA_CHECK(cudaEventElapsedTime(&t_split, ev[0], ev[1])); }
-    const int64_t chunk_rows = std::min<int64_t>(rows, std::max<int64_t>(256, ((static_cast<int64_t>(LEVELS_MIB) << 20) / K) / 256 * 256));
     ggml_cuda_pool_alloc<u32> levels_buf(ctx.pool(), chunk_rows * (K / 4));
     ggml_cuda_pool_alloc<int> products(ctx.pool(), plane_cols * chunk_rows);
     for (int64_t first = 0; first < rows; first += chunk_rows) {
