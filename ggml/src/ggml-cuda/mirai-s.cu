@@ -825,21 +825,51 @@ void launch_mul_mat(ggml_backend_cuda_context & ctx, const u8 * w, int64_t K, in
         return;
     }
     // long inputs: planes [2 * tokens][K]; the weights in chunks of rows as int8 levels, one int8 GEMM per chunk.
-    // prefill_planes == 1 (GGML_MIRAI_PREFILL_PLANES, see prefill_planes_for): multiply plane 0 only (half the GEMM
-    // work; the activations become per-token int8). The decode and small-batch paths are untouched. Gated by KL.
+    // prefill_planes == 1 (GGML_MIRAI_PREFILL_PLANES, see ggml_cuda_op_mirai_mul_mat): multiply plane 0 only (half
+    // the GEMM work; the activations become per-token int8). The decode and small-batch paths are untouched.
+    // GGML_MIRAI_TIMING=1: per-phase GPU time (split / level decode / GEMM / combine) accumulated over calls and
+    // printed every 1024 long-input calls (about four 512-token micro-batches). Synchronizes per call: diagnostics.
+    static const bool timing = getenv("GGML_MIRAI_TIMING") != nullptr;
     const int64_t plane_cols = prefill_planes * tokens;
     ggml_cuda_pool_alloc<u32> planes(ctx.pool(), 2 * tokens * (K / 4));
+    cudaEvent_t ev[4];
+    if (timing) { for (auto & e : ev) CUDA_CHECK(cudaEventCreate(&e)); CUDA_CHECK(cudaEventRecord(ev[0], stream)); }
     split_planes<<<dim3((groups_per_token + 255) / 256, tokens), 256, 0, stream>>>(q, groups_per_token, tokens, planes.get());
+    float t_split = 0.0f, t_levels = 0.0f, t_gemm = 0.0f, t_out = 0.0f;
+    if (timing) { CUDA_CHECK(cudaEventRecord(ev[1], stream)); CUDA_CHECK(cudaEventSynchronize(ev[1])); CUDA_CHECK(cudaEventElapsedTime(&t_split, ev[0], ev[1])); }
     const int64_t chunk_rows = std::min<int64_t>(rows, std::max<int64_t>(256, ((static_cast<int64_t>(LEVELS_MIB) << 20) / K) / 256 * 256));
     ggml_cuda_pool_alloc<u32> levels_buf(ctx.pool(), chunk_rows * (K / 4));
     ggml_cuda_pool_alloc<int> products(ctx.pool(), plane_cols * chunk_rows);
     for (int64_t first = 0; first < rows; first += chunk_rows) {
         const int64_t n_rows = std::min(chunk_rows, rows - first);
+        if (timing) CUDA_CHECK(cudaEventRecord(ev[0], stream));
         levels<F><<<n_rows / 32, 32 * GEMV_WARPS, 0, stream>>>(w, packets_per_row, first / 32, levels_buf.get(), groups_per_token);
+        if (timing) CUDA_CHECK(cudaEventRecord(ev[1], stream));
         // column-major: C (n_rows x plane_cols) = levels^T (n_rows x K) * planes (K x plane_cols); plane 0 comes first
         lt_int8_gemm(ctx, n_rows, plane_cols, K, levels_buf.get(), planes.get(), products.get());
+        if (timing) CUDA_CHECK(cudaEventRecord(ev[2], stream));
         prefill_output<<<dim3((n_rows + 255) / 256, tokens), 256, 0, stream>>>(
             products.get(), tokens, n_rows, rowscale + first, stats, codebook, y + first, rows, prefill_planes == 1);
+        if (timing) {
+            CUDA_CHECK(cudaEventRecord(ev[3], stream)); CUDA_CHECK(cudaEventSynchronize(ev[3]));
+            float a, b, c;
+            CUDA_CHECK(cudaEventElapsedTime(&a, ev[0], ev[1])); CUDA_CHECK(cudaEventElapsedTime(&b, ev[1], ev[2])); CUDA_CHECK(cudaEventElapsedTime(&c, ev[2], ev[3]));
+            t_levels += a; t_gemm += b; t_out += c;
+        }
+    }
+    if (timing) {
+        for (auto & e : ev) CUDA_CHECK(cudaEventDestroy(e));
+        static double s_split = 0, s_levels = 0, s_gemm = 0, s_out = 0; static int64_t s_calls = 0, s_params = 0, s_tokens = 0;
+        s_split += t_split; s_levels += t_levels; s_gemm += t_gemm; s_out += t_out; s_calls++; s_params += K * rows; s_tokens += tokens;
+        if (s_calls % 1024 == 0) {
+            const double total = s_split + s_levels + s_gemm + s_out;
+            GGML_LOG_INFO("mirai prefill timing over %lld calls (%lld params, %lld token-rows, planes %d): split %.1f%% levels %.1f%% gemm %.1f%% combine %.1f%%; "
+                          "levels %.0f Gparam/s, gemm %.1f ms per 512 tokens per 27B\n",
+                          (long long) s_calls, (long long) s_params, (long long) s_tokens, prefill_planes,
+                          100 * s_split / total, 100 * s_levels / total, 100 * s_gemm / total, 100 * s_out / total,
+                          s_params / (s_levels * 1e6), s_gemm * (512.0 / (double) s_tokens * s_calls) * (27e9 / (double) s_params * s_calls) / s_calls);
+            s_split = s_levels = s_gemm = s_out = 0; s_calls = s_params = s_tokens = 0;
+        }
     }
 }
 
