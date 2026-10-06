@@ -15,6 +15,12 @@ This is [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) wit
    prefill at KL 0.00028), the packed 1-bit KQ mask (`--kq-mask-packed`, read natively by the tensor-core attention
    kernel), and the level-decode chunk bounded by its buffer footprint (`GGML_MIRAI_LEVELS_MIB`).
 
+3. **Control-vector projection** (`--cvec-mode project`, from alesha-pro): llama.cpp's control vector applied as
+   `h -= |d| (h.v) v` after every layer in its range instead of `h += d`. A unit direction at scale 1.0 is removed
+   from the residual stream. With the refusal direction published next to the weights this is a run-time
+   abliteration for trellis codes that cannot be edited; layers without a direction in the file are left alone, and
+   without the flag nothing changes (greedy identity re-checked).
+
 Build like any llama.cpp with `-DGGML_CUDA=ON`; the product launcher, measurements and receipts live in
 [mirai-s-ada](https://github.com/professorpalmer/mirai-s-ada). The fork's original README is `README-upstream.md`;
 licenses: MIT throughout (the ggml authors, PrismML, alesha-pro; notices preserved). Not affiliated with any of them.
