@@ -1551,7 +1551,16 @@ ggml_tensor * llm_graph_context::build_mirai_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    GGML_ASSERT(mirai && "Mirai S weight without the model's mirai.* tensors");
+    // a drafter graph (DFlash / DSpark) borrows the target's head and embeddings through ctx_other: the codec's
+    // model-wide tensors then come from the target model, not from the drafter that owns this graph
+    const llama_mirai_s * ms = mirai;
+    if (ms == nullptr && cparams.ctx_other != nullptr) {
+        const llama_model * model_other = llama_get_model(cparams.ctx_other);
+        if (model_other != nullptr && model_other->mirai.enabled) {
+            ms = &model_other->mirai;
+        }
+    }
+    GGML_ASSERT(ms && "Mirai S weight without the model's mirai.* tensors");
     GGML_ASSERT(w_s && w_s->ne[0] == w->ne[1] && "Mirai S weight without its per-row scale");
     const bool head = w->type == GGML_TYPE_MS_I3;
     const int64_t n_in = w->ne[0];
@@ -1564,7 +1573,7 @@ ggml_tensor * llm_graph_context::build_mirai_mm(
     } else {
         ggml_tensor * x = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
         x = ggml_reshape_2d(ctx0, x, n_in, ggml_nelements(x) / n_in);
-        ggml_tensor * rot = head ? ggml_view_1d(ctx0, mirai->head_aux, n_in, 0) : mirai->rot(n_in);
+        ggml_tensor * rot = head ? ggml_view_1d(ctx0, ms->head_aux, n_in, 0) : ms->rot(n_in);
         GGML_ASSERT(rot && "Mirai S: no rotation for this input width");
         xq = ggml_mirai_quantize(ctx0, x, rot, head);
         mirai_xq.emplace(key, xq);
@@ -1572,10 +1581,10 @@ ggml_tensor * llm_graph_context::build_mirai_mm(
 
     ggml_tensor * res;
     if (head) {
-        ggml_tensor * ladder = ggml_view_1d(ctx0, mirai->head_aux, 16, n_in * sizeof(float));
+        ggml_tensor * ladder = ggml_view_1d(ctx0, ms->head_aux, 16, n_in * sizeof(float));
         res = ggml_mirai_mul_mat(ctx0, w, xq, w_s, ladder, nullptr);
     } else {
-        res = ggml_mirai_mul_mat(ctx0, w, xq, w_s, nullptr, mirai->codebook(w->type));
+        res = ggml_mirai_mul_mat(ctx0, w, xq, w_s, nullptr, ms->codebook(w->type));
     }
     if (ggml_n_dims(cur) > 2) {
         res = ggml_reshape_4d(ctx0, res, w->ne[1], cur->ne[1], cur->ne[2], cur->ne[3]);
