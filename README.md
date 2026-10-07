@@ -7,7 +7,8 @@ This is [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) wit
    CUDA address range, copy-engine staging), MTP drafting at every depth (`--spec-draft-window`,
    `--spec-draft-n-max-tail`), harness-proofing (`--reasoning-effort-allow/-fallback`, `--reasoning-max-tokens-floor`),
    batch-invariant kernels (`GGML_CUDA_BATCH_INVARIANT`), per-op GPU timing (`GGML_CUDA_OP_TIMING`).
-2. **Mirai S** ([alesha-pro/Qwen3.8-27B-S-mirai-GGUF](https://huggingface.co/alesha-pro/Qwen3.8-27B-S-mirai-GGUF)):
+2. **Mirai S** (Mirai Labs' Qwen3.8-27B-S, in alesha-pro's GGUF conversion
+   [alesha-pro/Qwen3.8-27B-S-mirai-GGUF](https://huggingface.co/alesha-pro/Qwen3.8-27B-S-mirai-GGUF)):
    the trellis codec ported from [alesha-pro/llama.cpp-mirai-s](https://github.com/alesha-pro/llama.cpp-mirai-s)
    (ggml types 90-93 with CPU and CUDA kernels, model-wide rotation tensors and per-row scales, the split attention
    gate, the graph hook), checked greedy token-for-token against that fork; then the prefill work done here:
@@ -23,4 +24,5 @@ This is [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) wit
 
 Build like any llama.cpp with `-DGGML_CUDA=ON`; the product launcher, measurements and receipts live in
 [mirai-s-ada](https://github.com/professorpalmer/mirai-s-ada). The fork's original README is `README-upstream.md`;
-licenses: MIT throughout (the ggml authors, PrismML, alesha-pro; notices preserved). Not affiliated with any of them.
+licenses: MIT throughout (the ggml authors, PrismML, alesha-pro; notices preserved). The model is Mirai Labs'. Not
+affiliated with any of them.
