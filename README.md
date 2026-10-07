@@ -9,7 +9,7 @@ This is [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) wit
    batch-invariant kernels (`GGML_CUDA_BATCH_INVARIANT`), per-op GPU timing (`GGML_CUDA_OP_TIMING`).
 2. **Mirai S** (Mirai Labs' Qwen3.8-27B-S, in alesha-pro's GGUF conversion
    [alesha-pro/Qwen3.8-27B-S-mirai-GGUF](https://huggingface.co/alesha-pro/Qwen3.8-27B-S-mirai-GGUF)):
-   the trellis codec ported from [alesha-pro/llama.cpp-mirai-s](https://github.com/alesha-pro/llama.cpp-mirai-s)
+   Mirai Labs' trellis codec, as alesha-pro ported it to ggml in [alesha-pro/llama.cpp-mirai-s](https://github.com/alesha-pro/llama.cpp-mirai-s)
    (ggml types 90-93 with CPU and CUDA kernels, model-wide rotation tensors and per-row scales, the split attention
    gate, the graph hook), checked greedy token-for-token against that fork; then the prefill work done here:
    `GGML_MIRAI_PREFILL_PLANES=ffn` (one int8 activation plane for the FFN matmuls of prompt-sized batches, +18%
@@ -24,5 +24,7 @@ This is [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) wit
 
 Build like any llama.cpp with `-DGGML_CUDA=ON`; the product launcher, measurements and receipts live in
 [mirai-s-ada](https://github.com/professorpalmer/mirai-s-ada). The fork's original README is `README-upstream.md`;
-licenses: MIT throughout (the ggml authors, PrismML, alesha-pro; notices preserved). The model is Mirai Labs'. Not
+licenses: MIT throughout (the ggml authors, PrismML, alesha-pro; notices preserved). The model and the Mirai S codec
+are Mirai Labs' (base model Qwen3.8-27B by Qwen). The planar activation layout and the batch-invariant mode are
+sudoingX's ([PrismML PR #218](https://github.com/PrismML-Eng/llama.cpp/pull/218)), kept with their authorship. Not
 affiliated with any of them.
