@@ -3776,10 +3776,15 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.drafting && !result.empty()) {
                 dp.drafting = false;
 
-                if (dp.n_max > 0) {
-                    if (!result.empty() && (int) result.size() > dp.n_max) {
-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
-                        result.resize(dp.n_max);
+                const auto t = impl.get()->type;
+                const bool lookup = t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE || t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
+                                    t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V || t == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
+                                    t == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+                const int32_t cap = lookup && dp.n_max_lookup > 0 ? dp.n_max_lookup : dp.n_max;
+                if (cap > 0) {
+                    if (!result.empty() && (int) result.size() > cap) {
+                        SPC_DBG("truncating draft to %d tokens\n", cap);
+                        result.resize(cap);
                     }
                 }
 

@@ -4207,6 +4207,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_max_tail = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_TAIL"));
+    add_opt(common_arg(
+        {"--spec-lookup-n-max"}, "N",
+        string_format("draft size for the lookup drafters (ngram-*) listed with a model drafter in --spec-type: they\n"
+                      "draft text already in the context, the model drafter keeps --spec-draft-n-max; 0 = same (default: %d)",
+                      params.speculative.draft.n_max_lookup),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_max_lookup = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_LOOKUP_N_MAX"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

@@ -345,6 +345,11 @@ struct common_params_speculative_draft {
     // is bound by reading the host tail over PCIe and a wider verify batch reads it once for all columns.
     int32_t n_max_tail = 0;
 
+    // draft size for the lookup drafters (ngram-*; 0 = the same limit as the model drafter). A lookup draft copies
+    // text that is already in the context, so a long draft is cheap and usually accepted; the model drafter (MTP)
+    // keeps --spec-draft-n-max, where long drafts cost more than they save.
+    int32_t n_max_lookup = 0;
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;

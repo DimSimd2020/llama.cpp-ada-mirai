@@ -210,6 +210,7 @@ struct server_slot {
     int32_t spec_n_max       = 0; // draft size (--spec-draft-n-max) below spec_tail_depth
     int32_t spec_n_max_tail  = 0; // draft size from spec_tail_depth on (--spec-draft-n-max-tail, 0 = spec_n_max)
     int32_t spec_tail_depth  = 0; // start of the tiered-KV host tail (--kv-vram-cells, 0 = none)
+    int32_t spec_n_max_lookup = 0; // draft size for the lookup drafters (--spec-lookup-n-max, 0 = the cap above)
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
@@ -473,6 +474,18 @@ struct server_slot {
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
+    }
+
+    // the same limits for the lookup drafters, with --spec-lookup-n-max in place of the model drafter's cap
+    int get_n_draft_max_lookup() const {
+        if (spec_n_max_lookup <= 0) {
+            return 0;
+        }
+        int n = n_ctx - prompt.n_tokens() - 2;
+        if (n_remaining() > 0) {
+            n = std::min(n, n_remaining() - 1);
+        }
+        return std::max(0, std::min(n, (int) spec_n_max_lookup));
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
@@ -1267,6 +1280,7 @@ private:
             slot.spec_n_max      = spec_n_max;
             slot.spec_n_max_tail = params_base.speculative.draft.n_max_tail;
             slot.spec_tail_depth = params_base.n_kv_vram_cells;
+            slot.spec_n_max_lookup = params_base.speculative.draft.n_max_lookup;
             slot.n_ctx   = n_ctx_slot;
 
             slot.stats.speculative = slot.can_speculate();
@@ -2978,6 +2992,7 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .n_max_lookup = */ slot.get_n_draft_max_lookup(),
                         };
 
                         drafting.push_back(&slot);

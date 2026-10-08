@@ -64,6 +64,9 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // limit for the lookup drafters (ngram-*); 0 = n_max
+    int32_t n_max_lookup = 0;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
