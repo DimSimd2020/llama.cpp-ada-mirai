@@ -63,3 +63,11 @@ The local launcher uses these additional settings:
 These are one-machine measurements, not a performance guarantee. Larger MTP
 drafts, the optional DFlash drafter, and a large decoded-weight cache were
 slower on this setup and are not part of the selected configuration.
+
+HIP TOP_K and ARGSORT now use hipCUB radix sorting for rows larger than 1024
+values. This covers the model's 248320-token vocabulary and allows top-k/top-p
+backend sampling without the former unsupported-operation fallback. All 615
+existing TOP_K/ARGSORT comparison tests passed, including ties, row batches,
+non-power-of-two sizes, and large rows. Keep the reasoning budget unlimited
+when using backend sampling; this server disables backend sampling if a
+reasoning-budget sampler is active, even when thinking is off.

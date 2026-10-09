@@ -18,3 +18,7 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
                                   const int       nrows,
                                   ggml_sort_order order,
                                   cudaStream_t    stream);
+
+#ifdef GGML_USE_HIP
+void ggml_cuda_argsort_hip(ggml_backend_cuda_context & ctx, const float * src, int * dst, int n, int rows, int k, ggml_sort_order order);
+#endif

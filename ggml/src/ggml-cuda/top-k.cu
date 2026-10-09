@@ -63,6 +63,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+#ifdef GGML_USE_HIP
+    if (ncols > 1024) {
+        ggml_cuda_argsort_hip(ctx, src0_d, dst_d, ncols, nrows, k, GGML_SORT_ORDER_DESC);
+        return;
+    }
+#endif
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391

@@ -248,6 +248,38 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     }
 }
 
+#ifdef GGML_USE_HIP
+#include <hipcub/device/device_radix_sort.hpp>
+
+static __global__ void radix_sort_indices(int * indices, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) indices[i] = i;
+}
+
+void ggml_cuda_argsort_hip(ggml_backend_cuda_context & ctx, const float * src, int * dst, int n, int rows, int k, ggml_sort_order order) {
+    ggml_cuda_pool_alloc<int> indices(ctx.pool(), n);
+    ggml_cuda_pool_alloc<int> sorted_indices(ctx.pool(), n);
+    ggml_cuda_pool_alloc<float> sorted_keys(ctx.pool(), n);
+    radix_sort_indices<<<(n + 255) / 256, 256, 0, ctx.stream()>>>(indices.get(), n);
+    auto sort = [&](void * temporary, size_t & bytes, const float * keys) {
+        if (order == GGML_SORT_ORDER_DESC) {
+            return hipcub::DeviceRadixSort::SortPairsDescending(temporary, bytes, keys, sorted_keys.get(),
+                indices.get(), sorted_indices.get(), n, 0, 32, ctx.stream());
+        }
+        return hipcub::DeviceRadixSort::SortPairs(temporary, bytes, keys, sorted_keys.get(),
+            indices.get(), sorted_indices.get(), n, 0, 32, ctx.stream());
+    };
+    size_t bytes = 0;
+    CUDA_CHECK(sort(nullptr, bytes, src));
+    ggml_cuda_pool_alloc<uint8_t> temporary(ctx.pool(), bytes);
+    for (int row = 0; row < rows; ++row) {
+        CUDA_CHECK(sort(temporary.get(), bytes, src + static_cast<size_t>(row) * n));
+        CUDA_CHECK(cudaMemcpyAsync(dst + static_cast<size_t>(row) * k, sorted_indices.get(),
+            k * sizeof(int), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+}
+#endif
+
 void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *)src0->data;
@@ -262,6 +294,12 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t nrows = ggml_nrows(src0);
 
     enum ggml_sort_order order = (enum ggml_sort_order) dst->op_params[0];
+#ifdef GGML_USE_HIP
+    if (ncols > 1024) {
+        ggml_cuda_argsort_hip(ctx, src0_d, (int *) dst_d, ncols, nrows, ncols, order);
+        return;
+    }
+#endif
 
 #ifdef GGML_CUDA_USE_CUB
     const int    ncols_pad      = next_power_of_2(ncols);
