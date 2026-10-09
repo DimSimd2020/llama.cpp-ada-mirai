@@ -7,7 +7,7 @@ namespace {
 typedef unsigned int u32;
 typedef unsigned short u16;
 typedef unsigned char u8;
-constexpr int GEMV_WARPS = 8;
+constexpr int GEMV_WARPS = 32;
 struct codebook_t {
     float c[5];
 };
@@ -73,23 +73,32 @@ __device__ __forceinline__ void load_packet(const uint4 * packets, int packet, i
     }
 }
 
+template <int T, int WORDS>
+__device__ __forceinline__ u32 state_at(const u32 (&bits)[4 * WORDS], u32 entry, int step) {
+    u32 state = (step + 1) * T < 16 ? entry << ((step + 1) * T) : 0;
+    #pragma unroll
+    for (int back = 0; back < (16 + T - 1) / T; ++back) {
+        if (step >= back) state |= symbol_at<T, WORDS>(bits, step - back) << (back * T);
+    }
+    return state & 0xFFFFu;
+}
 // Replays one packet of a lane's row, handing each 4-column word of levels (level + 54 per byte, columns 4g .. 4g+3 of
 // the packet) to use(word, g). Loops are fully unrolled, so g is a compile-time constant inside `use`.
 template <typename F, typename Use>
-__device__ __forceinline__ void decode_packet(const u32 (&bits)[4 * F::words], u32 state, Use && use) {
+__device__ __forceinline__ void decode_packet(const u32 (&bits)[4 * F::words], u32 entry, Use && use) {
     if constexpr (F::v == 4) {
 #pragma unroll
         for (int step = 0; step < F::steps; ++step) {
-            state = ((state << F::t) | symbol_at<F::t, F::words>(bits, step)) & 0xFFFFu;
+            const u32 state = state_at<F::t, F::words>(bits, entry, step);
             use(levels_plus_54(fmix_hash(state)), step);
         }
     } else {  // two V=2 steps make one word: bytes 0-1 of each step's hash
 #pragma unroll
         for (int step = 0; step < F::steps; step += 2) {
-            state = ((state << F::t) | symbol_at<F::t, F::words>(bits, step)) & 0xFFFFu;
+            const u32 state = state_at<F::t, F::words>(bits, entry, step);
             const u32 first = fmix_hash(state);
-            state = ((state << F::t) | symbol_at<F::t, F::words>(bits, step + 1)) & 0xFFFFu;
-            use(levels_plus_54((first & 0xFFFFu) | (fmix_hash(state) << 16)), step / 2);
+            const u32 next = state_at<F::t, F::words>(bits, entry, step + 1);
+            use(levels_plus_54((first & 0xFFFFu) | (fmix_hash(next) << 16)), step / 2);
         }
     }
 }
@@ -323,8 +332,72 @@ void quantize(ggml_backend_cuda_context & ctx, const float * x, const float * ro
 }
 
 template <typename F>
+__global__ void levels(const u8 * __restrict__ w, int packets_per_row, size_t first_group, u32 * __restrict__ out,
+                       int groups_per_row) {
+    const int lane = threadIdx.x & 31;
+    const trellis_group<F> tape = group_at<F>(w, first_group + blockIdx.x, packets_per_row);
+    const size_t row = static_cast<size_t>(blockIdx.x) * 32 + lane;
+    // each warp takes a run of consecutive packets, so every lane writes its row front to back
+    const int warps = blockDim.x >> 5, per_warp = (packets_per_row + warps - 1) / warps;
+    const int first_packet = (threadIdx.x >> 5) * per_warp, end_packet = min(packets_per_row, first_packet + per_warp);
+    for (int packet = first_packet; packet < end_packet; ++packet) {
+        u32 bits[4 * F::words];
+        load_packet<F::words>(tape.packets, packet, lane, bits);
+        uint4 * dst = reinterpret_cast<uint4 *>(out + row * groups_per_row + packet * (F::columns / 4));
+        u32 quad[4];
+        decode_packet<F>(bits, __ldg(tape.entries + packet * 32 + lane), [&](u32 word, int g) {
+            quad[g % 4] = word;
+            if (g % 4 == 3) dst[g / 4] = make_uint4(quad[0], quad[1], quad[2], quad[3]);
+        });
+    }
+}
+
+// q words [tokens][K / 4] (plane 0, plane 1) -> planes [2 * tokens][K]: plane 0 of every token, then plane 1
+__global__ void split_planes(const uint2 * __restrict__ q, int groups_per_token, int tokens, u32 * __restrict__ planes) {
+    const int token = blockIdx.y;
+    for (int g = blockIdx.x * blockDim.x + threadIdx.x; g < groups_per_token; g += gridDim.x * blockDim.x) {
+        const uint2 value = q[static_cast<size_t>(token) * groups_per_token + g];
+        planes[static_cast<size_t>(token) * groups_per_token + g] = value.x;
+        planes[(static_cast<size_t>(tokens) + token) * groups_per_token + g] = value.y;
+    }
+}
+
+// products: [2 * tokens][rows] int32, plane 0 of every token first, then plane 1. Grid (rows / 256, tokens).
+__global__ void prefill_output(const int * __restrict__ products, int tokens, int rows, const float * __restrict__ rowscale,
+                               const float * __restrict__ stats, codebook_t codebook, float * __restrict__ y, int y_stride) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x, token = blockIdx.y;
+    if (row >= rows) return;
+    const size_t index = static_cast<size_t>(token) * rows + row;
+    const int fine = products[static_cast<size_t>(tokens) * rows + index];
+    y[static_cast<size_t>(token) * y_stride + row] = output_value(products[index], fine, stats + token * 8, codebook, rowscale[row]);
+}
+
+template <typename F>
+void prefill(ggml_backend_cuda_context & ctx, const u8 * w, const float * scale, const uint2 * q,
+             const float * stats, codebook_t cb, float * y, int K, int N, int T) {
+    const int chunk_rows = std::min(N, 4096);
+    ggml_cuda_pool_alloc<u32> planes(ctx.pool(), static_cast<size_t>(2) * T * (K / 4));
+    ggml_cuda_pool_alloc<u32> decoded(ctx.pool(), static_cast<size_t>(chunk_rows) * (K / 4));
+    ggml_cuda_pool_alloc<int> products(ctx.pool(), static_cast<size_t>(2) * T * chunk_rows);
+    split_planes<<<dim3((K / 4 + 255) / 256, T), 256, 0, ctx.stream()>>>(q, K / 4, T, planes.get());
+    const int alpha = 1, beta = 0;
+    for (int first = 0; first < N; first += chunk_rows) {
+        const int rows = std::min(chunk_rows, N - first);
+        levels<F><<<rows / 32, 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, K / F::columns, first / 32, decoded.get(), K / 4);
+        CUBLAS_CHECK(hipblasGemmEx(ctx.cublas_handle(), HIPBLAS_OP_T, HIPBLAS_OP_N,
+            rows, 2 * T, K, &alpha, decoded.get(), HIP_R_8I, K, planes.get(), HIP_R_8I, K,
+            &beta, products.get(), HIP_R_32I, rows, HIPBLAS_COMPUTE_32I, HIPBLAS_GEMM_DEFAULT));
+        prefill_output<<<dim3((rows + 255) / 256, T), 256, 0, ctx.stream()>>>(
+            products.get(), T, rows, scale + first, stats, cb, y + first, N);
+    }
+}
+template <typename F>
 void mul(ggml_backend_cuda_context & ctx, const u8 * w, const float * scale, const uint2 * q,
          const float * stats, codebook_t cb, float * y, int K, int N, int T) {
+    if (T >= 16) {
+        prefill<F>(ctx, w, scale, q, stats, cb, y, K, N, T);
+        return;
+    }
     const int P = K / F::columns;
     if (T == 1) {
         trellis_mul<F, 1><<<dim3(N / 32, T), 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);

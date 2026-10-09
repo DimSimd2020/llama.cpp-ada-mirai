@@ -8471,7 +8471,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (auto shape : {std::pair<int, int>{5120, 5}, {6144, 3}, {17408, 17}}) {
         for (auto type : {GGML_TYPE_MS_V4T8, GGML_TYPE_MS_V2T4, GGML_TYPE_MS_V2T6, GGML_TYPE_MS_I3}) {
-            for (int tokens : {1, 4, 7}) {
+            for (int tokens : {1, 4, 7, 17, 64}) {
                 test_cases.emplace_back(new test_mirai(type, shape.first, tokens, shape.second));
             }
             test_cases.emplace_back(new test_mirai(type, shape.first, 1, shape.second, true));

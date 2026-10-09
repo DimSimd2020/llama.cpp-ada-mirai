@@ -6,7 +6,7 @@ MS_V2T4, MS_V2T6) and the MS_I3 output head are supported.
 
 The rotation and two-plane quantization follow the CPU reference. The matrix
 kernel decodes trellis packets on the GPU and uses AMD integer dot products.
-Single-token decode and four-token prefill tiles share the same math. The MS_I3
+Single-token decode and four-token verification tiles share the same math. Batches of at least 16 tokens decode row chunks and use exact int8/int32 hipBLAS GEMM for both activation planes. Trellis states are computed from the bit window without a serial replay dependency. The MS_I3
 head rounds its ladder and weights to FP16 before multiplication, as the CPU
 reference does. The HIP implementation does not use the approximate one-plane
 prefill option or NVIDIA tensor-core instructions.
@@ -26,7 +26,7 @@ test-backend-ops.exe -o MIRAI_MUL_MAT -b ROCm0
 ```
 
 They cover all four weight formats, the three rotation shapes used by Qwen3.8
-27B, token batches of 1, 4 and 7, dense rotations, and a zero input.
+27B, token batches of 1, 4, 7, 17 and 64, dense rotations, and a zero input.
 
 Set `HIP_VISIBLE_DEVICES` to the discrete GPU's physical HIP ordinal before
 starting the process. After filtering, its llama.cpp device name is `ROCm0`.
@@ -45,8 +45,21 @@ The Vulkan backend does not implement these operations in this fork. NVIDIA
 performance measurements do not describe the HIP kernels.
 
 Validated on Windows with ROCm SDK 10.0.0 and an RX 7900 XT (gfx1100):
-48/48 Mirai backend tests passed against the CPU reference. The Qwen3.8-27B-S
-model served through the OpenAI-compatible API with an 8192-token context,
-flash attention, one slot, and the published control vector. A 52-token prompt
-and 192-token reply measured 71.50 prompt tokens/s and 26.68 decode tokens/s.
-These are one-machine smoke-test measurements, not a performance guarantee.
+72/72 Mirai backend tests passed against the CPU reference. The model served
+through the OpenAI-compatible API with an 8192-token context, flash attention,
+one slot, and the published control vector. With backend sampling and MTP
+draft size 2, a 52-token prompt and 192-token reply generated 32-34 tokens/s
+in repeated runs, compared with 26.68 tokens/s in the first HIP port. A 1019-token
+copy-code prompt processed around 475-504 tokens/s. Adding lookup drafting
+raised generation for that copying task from 46.11 to 104.71 tokens/s with the
+same output. Copying throughput does not describe generation of new text.
+
+The local launcher uses these additional settings:
+
+```bat
+--backend-sampling --spec-type ngram-mod,draft-mtp --spec-lookup-n-max 32 --spec-draft-n-max 2 --spec-draft-n-max-tail 2 --spec-draft-window 8192 -ctkd q8_0 -ctvd q8_0 -b 1024 -ub 512
+```
+
+These are one-machine measurements, not a performance guarantee. Larger MTP
+drafts, the optional DFlash drafter, and a large decoded-weight cache were
+slower on this setup and are not part of the selected configuration.
