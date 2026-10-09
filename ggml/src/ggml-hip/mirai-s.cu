@@ -11,11 +11,12 @@ constexpr int GEMV_WARPS = 32;
 constexpr int HEAD_WARPS = 32;
 // Make shared input addresses scalar on wave32.
 __device__ __forceinline__ int warp_id() {
-#if defined(RDNA3) && __AMDGCN_WAVEFRONT_SIZE == 32
-    return __builtin_amdgcn_readfirstlane(threadIdx.x) >> 5;
-#else
-    return threadIdx.x >> 5;
+#if defined(RDNA3)
+    if constexpr (ggml_cuda_get_physical_warp_size() == 32) {
+        return __builtin_amdgcn_readfirstlane(threadIdx.x) >> 5;
+    }
 #endif
+    return threadIdx.x >> 5;
 }
 struct codebook_t {
     float c[5];
