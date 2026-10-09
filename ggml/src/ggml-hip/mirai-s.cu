@@ -8,6 +8,7 @@ typedef unsigned int u32;
 typedef unsigned short u16;
 typedef unsigned char u8;
 constexpr int GEMV_WARPS = 32;
+constexpr int HEAD_WARPS = 32;
 struct codebook_t {
     float c[5];
 };
@@ -139,34 +140,60 @@ __global__ void rotate_columns(const float * __restrict__ x, const float * __res
                                const float * __restrict__ small_q, float * __restrict__ rotated,
                                float * __restrict__ column_max) {
     constexpr int N = WIDTH * ORDER;
-    __shared__ float column[WIDTH];
+    constexpr int VALUES = WIDTH / 256;
+    __shared__ float column[WIDTH / 32][33];  // padding keeps the transpose from hitting one LDS bank
     __shared__ float mix[ORDER];
     __shared__ float shared[32];
     const int out = blockIdx.x;
     const size_t base = static_cast<size_t>(blockIdx.y) * N;
     if (threadIdx.x < ORDER) mix[threadIdx.x] = small_q[out * ORDER + threadIdx.x];
     __syncthreads();
-    for (int w = threadIdx.x; w < WIDTH; w += blockDim.x) {
+    float values[VALUES];
+    #pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int w = threadIdx.x + i * 256;
         float value = 0.0f;
 #pragma unroll
         for (int c = 0; c < ORDER; ++c) value += x[base + w * ORDER + c] * signs[w * ORDER + c] * mix[c];
-        column[w] = value;
+        values[i] = value;
     }
-    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    // H_WIDTH = H_(WIDTH/32) x H_32. Transpose once between the two warp-local transforms.
 #pragma unroll
-    for (int stride = 1; stride < WIDTH; stride <<= 1) {
-        for (int pair = threadIdx.x; pair < WIDTH / 2; pair += blockDim.x) {
-            const int low = (pair / stride) * 2 * stride + pair % stride, high = low + stride;
-            const float a = column[low], b = column[high];
-            column[low] = a + b;
-            column[high] = a - b;
+    for (int stride = 1; stride < 32; stride <<= 1) {
+        #pragma unroll
+        for (int i = 0; i < VALUES; ++i) {
+            const float other = __shfl_xor(values[i], stride, 32);
+            values[i] = lane & stride ? other - values[i] : values[i] + other;
         }
-        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < VALUES; ++i) column[warp + i * 8][lane] = values[i];
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < VALUES; ++i) values[i] = column[lane + (i / 4) * 32][warp + (i % 4) * 8];
+    #pragma unroll
+    for (int stride = 1; stride < 32; stride <<= 1) {
+        #pragma unroll
+        for (int i = 0; i < VALUES; ++i) {
+            const float other = __shfl_xor(values[i], stride, 32);
+            values[i] = lane & stride ? other - values[i] : values[i] + other;
+        }
+    }
+    if constexpr (WIDTH == 2048) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float a = values[i], b = values[i + 4];
+            values[i] = a + b;
+            values[i + 4] = a - b;
+        }
     }
     const float normalization = rsqrtf(static_cast<float>(WIDTH));
     float maximum = 0.0f;
-    for (int w = threadIdx.x; w < WIDTH; w += blockDim.x) {
-        const float value = column[w] * normalization;
+    #pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int w = (lane + (i / 4) * 32) * 32 + warp + (i % 4) * 8;
+        const float value = values[i] * normalization;
         rotated[base + w * ORDER + out] = value;
         maximum = fmaxf(maximum, fabsf(value));
     }
@@ -240,7 +267,7 @@ __global__ void __launch_bounds__(256) head_input(const float * __restrict__ x, 
     }
 }
 
-template <typename F, int TILE>
+template <typename F, int TILE, bool FULL = false>
 __global__ void trellis_mul(const u8 * w, int packets, const float * scale, const uint2 * q,
                            const float * stats, codebook_t codebook, float * y, int K, int N, int T) {
     __shared__ int partial[TILE][2][GEMV_WARPS][32];
@@ -254,7 +281,7 @@ __global__ void trellis_mul(const u8 * w, int packets, const float * scale, cons
             #pragma unroll
             for (int t = 0; t < TILE; ++t) {
                 const int token = blockIdx.y * TILE + t;
-                if (token < T) {
+                if (FULL || token < T) {
                     const uint2 value = q[static_cast<size_t>(token) * (K / 4) + p * F::columns / 4 + g];
                     coarse[t] = dp4a_us(levels, value.x, coarse[t]);
                     fine[t] = dp4a_us(levels, value.y, fine[t]);
@@ -273,7 +300,7 @@ __global__ void trellis_mul(const u8 * w, int packets, const float * scale, cons
     #pragma unroll
     for (int t = 0; t < TILE; ++t) {
         const int token = blockIdx.y * TILE + t;
-        if (token >= T) continue;
+        if (!FULL && token >= T) continue;
         int c = 0, f = 0;
         #pragma unroll
         for (int s = 0; s < GEMV_WARPS; ++s) {
@@ -284,16 +311,24 @@ __global__ void trellis_mul(const u8 * w, int packets, const float * scale, cons
     }
 }
 
+// Two exact integer codes in FP16, followed by the same FP16 ladder multiplication as the CPU reference.
+__device__ __forceinline__ half2 head_weight_pair(u32 codes, half2 step) {
+    const u32 packed = ((codes & 63u) * 16386u & 0x000E000Eu) | 0x64006400u;
+    const half2 encoded = __halves2half2(__ushort_as_half(static_cast<u16>(packed)), __ushort_as_half(packed >> 16));
+    const half2 integers = __hadd2(encoded, __float2half2_rn(-1031.0f));
+    return __hmul2(integers, step);
+}
+
+template <int TILE, bool FULL = false>
 __global__ void head_mul(const u8 * w, const half * x, const float * scale, const float * ladder,
-                         float * y, int K, int N) {
-    __shared__ float partial[GEMV_WARPS][32];
+                         float * y, int K, int N, int T) {
+    __shared__ float partial[TILE][HEAD_WARPS][32];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const size_t pairs = K / 128;
     const size_t group_bytes = pairs * 32 * (3 * 16 + 1);
     const u8 * base = w + static_cast<size_t>(blockIdx.x) * group_bytes;
-    const half * xt = x + static_cast<size_t>(blockIdx.y) * K;
-    float sum = 0.0f;
-    for (size_t pair = warp; pair < pairs; pair += GEMV_WARPS) {
+    float sum[TILE] = {};
+    for (size_t pair = warp; pair < pairs; pair += HEAD_WARPS) {
         u32 bits[12];
         #pragma unroll
         for (int part = 0; part < 3; ++part) {
@@ -304,23 +339,36 @@ __global__ void head_mul(const u8 * w, const half * x, const float * scale, cons
         const u8 steps = base[pairs * 3 * 32 * 16 + pair * 32 + lane];
         #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const float step = __half2float(__float2half_rn(ladder[h ? steps >> 4 : steps & 15]));
+            const half2 step = __float2half2_rn(ladder[h ? steps >> 4 : steps & 15]);
             #pragma unroll
-            for (int j = 0; j < 64; ++j) {
-                const int code = symbol_at<3, 3>(bits, h * 64 + j);
-                const float weight = __half2float(__float2half_rn((2 * code - 7) * step));
-                sum += weight * __half2float(xt[pair * 128 + h * 64 + j]);
+            for (int j = 0; j < 64; j += 2) {
+                const half2 weights = head_weight_pair(symbol_at<6, 3>(bits, h * 32 + j / 2), step);
+                #pragma unroll
+                for (int t = 0; t < TILE; ++t) {
+                    const int token = blockIdx.y * TILE + t;
+                    if (FULL || token < T) {
+                        const half2 value = reinterpret_cast<const half2 *>(x + static_cast<size_t>(token) * K)
+                            [pair * 64 + h * 32 + j / 2];
+                        ggml_cuda_mad(sum[t], weights, value);
+                    }
+                }
             }
         }
     }
-    partial[warp][lane] = sum;
+    #pragma unroll
+    for (int t = 0; t < TILE; ++t) partial[t][warp][lane] = sum[t];
     __syncthreads();
     if (warp != 0) return;
-    sum = 0.0f;
-    #pragma unroll
-    for (int s = 0; s < GEMV_WARPS; ++s) sum += partial[s][lane];
     const int row = blockIdx.x * 32 + lane;
-    y[static_cast<size_t>(blockIdx.y) * N + row] = scale[row] * sum;
+    #pragma unroll
+    for (int t = 0; t < TILE; ++t) {
+        const int token = blockIdx.y * TILE + t;
+        if (!FULL && token >= T) continue;
+        float value = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < HEAD_WARPS; ++s) value += partial[t][s][lane];
+        y[static_cast<size_t>(token) * N + row] = scale[row] * value;
+    }
 }
 
 template <int WIDTH, int ORDER>
@@ -400,7 +448,13 @@ void mul(ggml_backend_cuda_context & ctx, const u8 * w, const float * scale, con
     }
     const int P = K / F::columns;
     if (T == 1) {
-        trellis_mul<F, 1><<<dim3(N / 32, T), 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);
+        trellis_mul<F, 1, true><<<N / 32, 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);
+    } else if (T == 2) {
+        trellis_mul<F, 2, true><<<N / 32, 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);
+    } else if (T == 3) {
+        trellis_mul<F, 3, true><<<N / 32, 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);
+    } else if (T % 4 == 0) {
+        trellis_mul<F, 4, true><<<dim3(N / 32, T / 4), 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);
     } else {
         trellis_mul<F, 4><<<dim3(N / 32, (T + 3) / 4), 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);
     }
@@ -453,8 +507,22 @@ void ggml_cuda_op_mirai_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const float * scale = static_cast<const float *>(dst->src[2]->data);
     float * y = static_cast<float *>(dst->data);
     if (w->type == GGML_TYPE_MS_I3) {
-        head_mul<<<dim3(N / 32, T), 32 * GEMV_WARPS, 0, ctx.stream()>>>(wd, static_cast<const half *>(x->data), scale,
-            static_cast<const float *>(dst->src[3]->data), y, K, N);
+        if (T == 1) {
+            head_mul<1, true><<<N / 32, 32 * HEAD_WARPS, 0, ctx.stream()>>>(wd, static_cast<const half *>(x->data), scale,
+                static_cast<const float *>(dst->src[3]->data), y, K, N, T);
+        } else if (T == 2) {
+            head_mul<2, true><<<N / 32, 32 * HEAD_WARPS, 0, ctx.stream()>>>(wd, static_cast<const half *>(x->data), scale,
+                static_cast<const float *>(dst->src[3]->data), y, K, N, T);
+        } else if (T == 3) {
+            head_mul<3, true><<<N / 32, 32 * HEAD_WARPS, 0, ctx.stream()>>>(wd, static_cast<const half *>(x->data), scale,
+                static_cast<const float *>(dst->src[3]->data), y, K, N, T);
+        } else if (T % 4 == 0) {
+            head_mul<4, true><<<dim3(N / 32, T / 4), 32 * HEAD_WARPS, 0, ctx.stream()>>>(wd, static_cast<const half *>(x->data), scale,
+                static_cast<const float *>(dst->src[3]->data), y, K, N, T);
+        } else {
+            head_mul<4><<<dim3(N / 32, (T + 3) / 4), 32 * HEAD_WARPS, 0, ctx.stream()>>>(wd, static_cast<const half *>(x->data), scale,
+                static_cast<const float *>(dst->src[3]->data), y, K, N, T);
+        }
     } else {
         const uint2 * q = static_cast<const uint2 *>(x->data);
         const float * stats = reinterpret_cast<const float *>(q + static_cast<size_t>(T) * (K / 4));

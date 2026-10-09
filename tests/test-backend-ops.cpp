@@ -8401,15 +8401,15 @@ static const ggml_type other_types[] = {
 
 struct test_mirai : public test_case {
     ggml_type type;
-    int64_t K, T;
+    int64_t K, T, N;
     int order;
     bool zero;
 
-    test_mirai(ggml_type type, int64_t K, int64_t T, int order, bool zero = false)
-        : type(type), K(K), T(T), order(order), zero(zero) {}
+    test_mirai(ggml_type type, int64_t K, int64_t T, int order, bool zero = false, int64_t N = 64)
+        : type(type), K(K), T(T), N(N), order(order), zero(zero) {}
 
     std::string vars() override {
-        return VARS_TO_STR5(type, K, T, order, zero);
+        return VARS_TO_STR6(type, K, T, N, order, zero);
     }
 
     bool run_whole_graph() override { return true; }
@@ -8418,8 +8418,8 @@ struct test_mirai : public test_case {
         const bool head = type == GGML_TYPE_MS_I3;
         auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, T);
         auto * rot = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K + (head ? 0 : order * order));
-        auto * w = ggml_new_tensor_2d(ctx, type, K, 64);
-        auto * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+        auto * w = ggml_new_tensor_2d(ctx, type, K, N);
+        auto * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N);
         ggml_set_name(x, "mirai_x");
         ggml_set_name(rot, "mirai_rot");
         ggml_tensor * ladder = nullptr;
@@ -8471,7 +8471,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (auto shape : {std::pair<int, int>{5120, 5}, {6144, 3}, {17408, 17}}) {
         for (auto type : {GGML_TYPE_MS_V4T8, GGML_TYPE_MS_V2T4, GGML_TYPE_MS_V2T6, GGML_TYPE_MS_I3}) {
-            for (int tokens : {1, 4, 7, 17, 64}) {
+            for (int tokens : {1, 2, 3, 4, 7, 17, 64}) {
                 test_cases.emplace_back(new test_mirai(type, shape.first, tokens, shape.second));
             }
             test_cases.emplace_back(new test_mirai(type, shape.first, 1, shape.second, true));
@@ -10432,6 +10432,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int tokens : {1, 3, 16}) {
+        test_cases.emplace_back(new test_mirai(GGML_TYPE_MS_I3, 5120, tokens, 5, false, 248320));
+        for (auto type : {GGML_TYPE_MS_V4T8, GGML_TYPE_MS_V2T4, GGML_TYPE_MS_V2T6}) {
+            test_cases.emplace_back(new test_mirai(type, 5120, tokens, 5, false, 17408));
+            test_cases.emplace_back(new test_mirai(type, 17408, tokens, 17, false, 5120));
+        }
+    }
     // bandwidth comparison at Bonsai-2 shapes
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_TQ2_0}) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 1, 5120, {1, 1}, {1, 1}));

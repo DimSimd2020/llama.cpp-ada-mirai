@@ -26,7 +26,7 @@ test-backend-ops.exe -o MIRAI_MUL_MAT -b ROCm0
 ```
 
 They cover all four weight formats, the three rotation shapes used by Qwen3.8
-27B, token batches of 1, 4, 7, 17 and 64, dense rotations, and a zero input.
+27B, token batches of 1, 2, 3, 4, 7, 17 and 64, dense rotations, and a zero input.
 
 Set `HIP_VISIBLE_DEVICES` to the discrete GPU's physical HIP ordinal before
 starting the process. After filtering, its llama.cpp device name is `ROCm0`.
@@ -45,14 +45,10 @@ The Vulkan backend does not implement these operations in this fork. NVIDIA
 performance measurements do not describe the HIP kernels.
 
 Validated on Windows with ROCm SDK 10.0.0 and an RX 7900 XT (gfx1100):
-72/72 Mirai backend tests passed against the CPU reference. The model served
+96/96 Mirai backend tests passed against the CPU reference. The model served
 through the OpenAI-compatible API with an 8192-token context, flash attention,
-one slot, and the published control vector. With backend sampling and MTP
-draft size 2, a 52-token prompt and 192-token reply generated 32-34 tokens/s
-in repeated runs, compared with 26.68 tokens/s in the first HIP port. A 1019-token
-copy-code prompt processed around 475-504 tokens/s. Adding lookup drafting
-raised generation for that copying task from 46.11 to 104.71 tokens/s with the
-same output. Copying throughput does not describe generation of new text.
+one slot, and the published control vector. New-text and copying throughput
+are measured separately because lookup drafting can reuse known text.
 
 The local launcher uses these additional settings:
 
@@ -71,3 +67,33 @@ existing TOP_K/ARGSORT comparison tests passed, including ties, row batches,
 non-power-of-two sizes, and large rows. Keep the reasoning budget unlimited
 when using backend sampling; this server disables backend sampling if a
 reasoning-budget sampler is active, even when thinking is off.
+
+The next optimization specializes complete one-, two-, three- and four-token
+tiles, avoiding per-token bounds checks in the inner matrix loops. Partial
+four-token tiles still check bounds. The output head decodes each weight pair
+once per tile and uses packed FP16 multiplication with FP32 dot-product
+accumulation. Rotation uses two warp-local Hadamard transforms with one padded
+shared-memory transpose, preserving the butterfly order and both activation
+planes.
+
+On the same RX 7900 XT, the first 52/192-token request after a server restart
+generated 45.57 tokens/s and took 4.61 seconds. A three-prompt comparison
+(DNS explanation, fictional story, seasons explanation; 256 output tokens each)
+improved from 35.43/30.23/35.10 to 48.22/40.04/48.40 tokens/s. Each prompt was
+new to its respective process, and the generated texts matched. These are
+new-text measurements, not repeats of a response learned by lookup drafting.
+All 711 CPU comparison tests passed: 96 Mirai cases and the existing 615
+TOP_K/ARGSORT cases. The main GGUF and control vector are unchanged.
+
+The existing performance harness now also covers the real 248320-row output
+head and 5120/17408 matrix shapes. On Windows, large repeated-node HIP graphs
+can exhaust the test process's stack; disable graphs for this isolated kernel
+benchmark only:
+
+```bat
+set GGML_CUDA_DISABLE_GRAPHS=1
+test-backend-ops.exe perf -o MIRAI_MUL_MAT -b ROCm0
+```
+
+Keep HIP graphs enabled in the serving process. End-to-end measurements above
+use graphs, MTP draft size 2, backend sampling and lookup drafting.
