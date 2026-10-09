@@ -8471,7 +8471,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (auto shape : {std::pair<int, int>{5120, 5}, {6144, 3}, {17408, 17}}) {
         for (auto type : {GGML_TYPE_MS_V4T8, GGML_TYPE_MS_V2T4, GGML_TYPE_MS_V2T6, GGML_TYPE_MS_I3}) {
-            for (int tokens : {1, 2, 3, 4, 7, 17, 64}) {
+            for (int tokens : {1, 2, 3, 4, 5, 7, 17, 64}) {
                 test_cases.emplace_back(new test_mirai(type, shape.first, tokens, shape.second));
             }
             test_cases.emplace_back(new test_mirai(type, shape.first, 1, shape.second, true));
@@ -10432,7 +10432,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
-    for (int tokens : {1, 3, 16}) {
+    for (int tokens : {1, 3, 5, 16}) {
         test_cases.emplace_back(new test_mirai(GGML_TYPE_MS_I3, 5120, tokens, 5, false, 248320));
         for (auto type : {GGML_TYPE_MS_V4T8, GGML_TYPE_MS_V2T4, GGML_TYPE_MS_V2T6}) {
             test_cases.emplace_back(new test_mirai(type, 5120, tokens, 5, false, 17408));

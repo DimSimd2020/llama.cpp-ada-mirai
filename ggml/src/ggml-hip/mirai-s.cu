@@ -9,6 +9,14 @@ typedef unsigned short u16;
 typedef unsigned char u8;
 constexpr int GEMV_WARPS = 32;
 constexpr int HEAD_WARPS = 32;
+// Make shared input addresses scalar on wave32.
+__device__ __forceinline__ int warp_id() {
+#if defined(RDNA3) && __AMDGCN_WAVEFRONT_SIZE == 32
+    return __builtin_amdgcn_readfirstlane(threadIdx.x) >> 5;
+#else
+    return threadIdx.x >> 5;
+#endif
+}
 struct codebook_t {
     float c[5];
 };
@@ -98,7 +106,7 @@ __device__ __forceinline__ void decode_packet(const u32 (&bits)[4 * F::words], u
         for (int step = 0; step < F::steps; step += 2) {
             const u32 state = state_at<F::t, F::words>(bits, entry, step);
             const u32 first = fmix_hash(state);
-            const u32 next = state_at<F::t, F::words>(bits, entry, step + 1);
+            const u32 next = ((state << F::t) | symbol_at<F::t, F::words>(bits, step + 1)) & 0xFFFFu;
             use(levels_plus_54((first & 0xFFFFu) | (fmix_hash(next) << 16)), step / 2);
         }
     }
@@ -271,7 +279,7 @@ template <typename F, int TILE, bool FULL = false>
 __global__ void trellis_mul(const u8 * w, int packets, const float * scale, const uint2 * q,
                            const float * stats, codebook_t codebook, float * y, int K, int N, int T) {
     __shared__ int partial[TILE][2][GEMV_WARPS][32];
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31, warp = warp_id();
     const trellis_group<F> tape = group_at<F>(w, blockIdx.x, packets);
     int coarse[TILE] = {}, fine[TILE] = {};
     for (int p = warp; p < packets; p += GEMV_WARPS) {
@@ -323,7 +331,7 @@ template <int TILE, bool FULL = false>
 __global__ void head_mul(const u8 * w, const half * x, const float * scale, const float * ladder,
                          float * y, int K, int N, int T) {
     __shared__ float partial[TILE][HEAD_WARPS][32];
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31, warp = warp_id();
     const size_t pairs = K / 128;
     const size_t group_bytes = pairs * 32 * (3 * 16 + 1);
     const u8 * base = w + static_cast<size_t>(blockIdx.x) * group_bytes;
@@ -453,6 +461,8 @@ void mul(ggml_backend_cuda_context & ctx, const u8 * w, const float * scale, con
         trellis_mul<F, 2, true><<<N / 32, 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);
     } else if (T == 3) {
         trellis_mul<F, 3, true><<<N / 32, 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);
+    } else if (T == 5) {
+        trellis_mul<F, 5, true><<<N / 32, 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);
     } else if (T % 4 == 0) {
         trellis_mul<F, 4, true><<<dim3(N / 32, T / 4), 32 * GEMV_WARPS, 0, ctx.stream()>>>(w, P, scale, q, stats, cb, y, K, N, T);
     } else {
@@ -515,6 +525,9 @@ void ggml_cuda_op_mirai_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 static_cast<const float *>(dst->src[3]->data), y, K, N, T);
         } else if (T == 3) {
             head_mul<3, true><<<N / 32, 32 * HEAD_WARPS, 0, ctx.stream()>>>(wd, static_cast<const half *>(x->data), scale,
+                static_cast<const float *>(dst->src[3]->data), y, K, N, T);
+        } else if (T == 5) {
+            head_mul<5, true><<<N / 32, 32 * HEAD_WARPS, 0, ctx.stream()>>>(wd, static_cast<const half *>(x->data), scale,
                 static_cast<const float *>(dst->src[3]->data), y, K, N, T);
         } else if (T % 4 == 0) {
             head_mul<4, true><<<dim3(N / 32, T / 4), 32 * HEAD_WARPS, 0, ctx.stream()>>>(wd, static_cast<const half *>(x->data), scale,
