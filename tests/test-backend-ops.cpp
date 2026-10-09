@@ -8399,10 +8399,84 @@ static const ggml_type other_types[] = {
 #pragma optimize("", off)
 #endif
 
+struct test_mirai : public test_case {
+    ggml_type type;
+    int64_t K, T;
+    int order;
+    bool zero;
+
+    test_mirai(ggml_type type, int64_t K, int64_t T, int order, bool zero = false)
+        : type(type), K(K), T(T), order(order), zero(zero) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, K, T, order, zero);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const bool head = type == GGML_TYPE_MS_I3;
+        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, T);
+        auto * rot = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K + (head ? 0 : order * order));
+        auto * w = ggml_new_tensor_2d(ctx, type, K, 64);
+        auto * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+        ggml_set_name(x, "mirai_x");
+        ggml_set_name(rot, "mirai_rot");
+        ggml_tensor * ladder = nullptr;
+        if (head) {
+            ladder = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+            ggml_set_name(ladder, "mirai_ladder");
+        }
+        const float codebook[5] = {0.03125f, 0.01f, -0.02f, 0.03f, -0.01f};
+        auto * q = ggml_mirai_quantize(ctx, x, rot, head);
+        return ggml_mirai_mul_mat(ctx, w, q, scale, ladder, head ? nullptr : codebook);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_mirai_s(t->type)) {
+                std::vector<uint8_t> data(ggml_nbytes(t));
+                for (size_t i = 0; i < data.size(); ++i) data[i] = (i * 17 + 13) & 255;
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+            } else if (strcmp(t->name, "mirai_rot") == 0) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                for (int64_t i = 0; i < K; ++i) data[i] = i % 3 ? 1.0f : -1.0f;
+                if (type != GGML_TYPE_MS_I3) {
+                    for (int i = 0; i < order; ++i) {
+                        for (int j = 0; j < order; ++j) {
+                            data[K + i * order + j] = std::cos(3.14159265f * (j + 0.5f) * i / order) *
+                                std::sqrt((i ? 2.0f : 1.0f) / order);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (strcmp(t->name, "mirai_ladder") == 0) {
+                float data[16];
+                for (int i = 0; i < 16; ++i) data[i] = 0.003f * (i + 1);
+                ggml_backend_tensor_set(t, data, 0, sizeof(data));
+            } else if (zero && strcmp(t->name, "mirai_x") == 0) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
+
+    for (auto shape : {std::pair<int, int>{5120, 5}, {6144, 3}, {17408, 17}}) {
+        for (auto type : {GGML_TYPE_MS_V4T8, GGML_TYPE_MS_V2T4, GGML_TYPE_MS_V2T6, GGML_TYPE_MS_I3}) {
+            for (int tokens : {1, 4, 7}) {
+                test_cases.emplace_back(new test_mirai(type, shape.first, tokens, shape.second));
+            }
+            test_cases.emplace_back(new test_mirai(type, shape.first, 1, shape.second, true));
+        }
+    }
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
